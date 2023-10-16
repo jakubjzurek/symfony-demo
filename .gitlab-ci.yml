@@ -1,0 +1,107 @@
+image: jakubzurek/php8.1-base
+
+.configure-git:
+  before_script:
+    - git clean -f -d -x
+    - mkdir -p ~/.ssh
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa_key
+    - chmod 600 ~/.ssh/id_rsa_key
+    - eval $(ssh-agent -s)
+    - ssh-add ~/.ssh/id_rsa_key
+    - ssh-keyscan gitlab.ailleron.com >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+    - git config --global user.email "${GITLAB_USER_EMAIL}"
+    - git config --global user.name "${GITLAB_USER_NAME}"
+
+        
+stages:
+  - tests
+  - build&deploy
+
+default:
+  tags:
+    - jazu
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - vendor/
+
+variables:
+  GIT_STRATEGY: clone
+  DOCKER_REPOSITORY: "jakubzurek"
+  NEW_VERSION: ""
+
+STATIC ANALYSIS:
+  stage: tests
+    
+  script: |
+    composer require phpstan/phpstan
+    ./vendor/bin/phpstan -v analyze --autoload-file=./vendor/autoload.php src --level 7 --memory-limit 1G
+
+UNIT TESTS:
+  stage: tests
+
+  script: |
+    # composer install -o
+    composer require symfony/runtime
+    php bin/phpunit
+
+BUILD AND DEPLOY:
+  stage: build&deploy
+
+  extends:
+    - .configure-git
+  services:
+    - docker:dind
+  script: |
+    CURRENT_VERSION=$(cat composer.json | jq .version | tr -d '"')
+    echo "current version $CURRENT_VERSION"
+    IFS='.' read -r major minor patch <<< "$CURRENT_VERSION"
+    NEW_VERSION="$major.$minor.$((patch + 1))"
+    
+    ls -la
+    
+    composer install
+    docker login -u $DOCKER_USER -p $DOCKER_PASSWORD
+    docker build . -t $DOCKER_REPOSITORY/$CI_PROJECT_NAME:$NEW_VERSION
+    docker push $DOCKER_REPOSITORY/$CI_PROJECT_NAME:$NEW_VERSION
+
+
+    git checkout -B "$CI_BUILD_REF_NAME" ${CI_COMMIT_SHA}
+    git remote update
+     sed -i "s/\"version\":.*/\"version\": \"$NEW_VERSION\",/"  composer.json
+    git add composer.json
+    git commit -m "Bump version: $NEW_VERSION [ci skip]"
+    git tag $NEW_VERSION
+    git push -v "https://${GITLAB_USER_NAME}:${CI_GIT_TOKEN}@${CI_REPOSITORY_URL#*@}" --follow-tags
+    
+    curl --header "PRIVATE-TOKEN: $CI_GIT_TOKEN" /
+    --output values.yaml "https://gitlab.example.com/api/v4/projects/$CI_PROJECT_ID/repository/files/values.yaml/raw"
+
+    sed -i "s/tag:.*/tag: $NEW_VERSION/" values.yaml
+
+    curl --request PUT --header "PRIVATE-TOKEN: $CI_GIT_TOKEN" /
+    --data "branch=main&content=$(cat values.yaml | base64)" /
+    --data "commit_message=Update ${CI_PROJECT_NAME} with version: ${NEW_VERSION}" /
+    "https://gitlab.ailleron.com/api/v4/projects/helm_charts_repository/repository/files/values.yaml"
+  when: on_success
+
+
+DEPLOY PRODUCTION:
+  stage: build&deploy
+  script: |
+    NEW_VERSION=$(cat composer.json | jq .version | tr -d '"')
+    echo $NEW_VERSION
+    curl --header "PRIVATE-TOKEN: $CI_GIT_TOKEN" /
+    --output values.yaml "https://gitlab.example.com/api/v4/projects/$CI_PROJECT_ID/repository/files/values.yaml/raw"
+
+    sed -i "s/tag:.*/tag: $NEW_VERSION/" values.yaml
+
+    curl --request PUT --header "PRIVATE-TOKEN: $CI_GIT_TOKEN" \
+     --form "branch=$CI_GIT_BRANCH" \
+     --form "commit_message=UPDATE VERSION: $NEW_VERSION of $CI_PROJECT_NAME" \
+     --form "content=$(cat values.yaml)" \
+     "https://gitlab.example.com/api/v4/projects/$CI_PROJECT_ID/repository/files/values.yaml"
+
+  when: manual
